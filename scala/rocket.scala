@@ -1,0 +1,782 @@
+// See LICENSE for license details.
+
+package rocket
+
+import Chisel._
+import junctions._
+import uncore._
+import open_soc_debug._
+import Util._
+import cde.{Parameters, Field}
+
+case object UseFPU extends Field[Boolean]
+case object FDivSqrt extends Field[Boolean]
+case object XLen extends Field[Int]
+case object FetchWidth extends Field[Int]
+case object RetireWidth extends Field[Int]
+case object UseVM extends Field[Boolean]
+case object UsePerfCounters extends Field[Boolean]
+case object FastLoadWord extends Field[Boolean]
+case object FastLoadByte extends Field[Boolean]
+case object FastMulDiv extends Field[Boolean]
+case object CoreInstBits extends Field[Int]
+case object CoreDataBits extends Field[Int]
+case object CoreDCacheReqTagBits extends Field[Int]
+case object NCustomMRWCSRs extends Field[Int]
+case object MtvecWritable extends Field[Boolean]
+case object MtvecInit extends Field[BigInt]
+case object ResetVector extends Field[BigInt]
+case object EmitLogMessages extends Field[Boolean]
+
+trait HasCoreParameters extends HasAddrMapParameters {
+  implicit val p: Parameters
+  val xLen = p(XLen)
+
+  val usingVM = p(UseVM)
+  val usingFPU = p(UseFPU)
+  val usingFDivSqrt = p(FDivSqrt)
+  val usingRoCC = !p(BuildRoCC).isEmpty
+  val usingFastMulDiv = p(FastMulDiv)
+  val fastLoadWord = p(FastLoadWord)
+  val fastLoadByte = p(FastLoadByte)
+
+  val retireWidth = p(RetireWidth)
+  val fetchWidth = p(FetchWidth)
+  val coreInstBits = p(CoreInstBits)
+  val coreInstBytes = coreInstBits/8
+  val coreDataBits = xLen
+  val coreDataBytes = coreDataBits/8
+  val coreDCacheReqTagBits = 7 + (2 + (if(!usingRoCC) 0 else 1))
+  val vpnBitsExtended = vpnBits + (vaddrBits < xLen).toInt
+  val vaddrBitsExtended = vpnBitsExtended + pgIdxBits
+  val coreMaxAddrBits = paddrBits max vaddrBitsExtended
+  val nCustomMrwCsrs = p(NCustomMRWCSRs)
+  val roccCsrs = if (p(BuildRoCC).isEmpty) Nil
+    else p(BuildRoCC).flatMap(_.csrs)
+  val nRoccCsrs = p(RoccNCSRs)
+  val nCores = p(SCRKey).nCores
+
+  // Print out log of committed instructions and their writeback values.
+  // Requires post-processing due to out-of-order writebacks.
+  val enableCommitLog = false
+  val usingPerfCounters = p(UsePerfCounters)
+
+  if (fastLoadByte) require(fastLoadWord)
+  val emitLog = p(EmitLogMessages)
+}
+
+abstract class CoreModule(implicit val p: Parameters) extends Module
+  with HasCoreParameters
+abstract class CoreBundle(implicit val p: Parameters) extends ParameterizedBundle()(p)
+  with HasCoreParameters
+
+class RegFile(n: Int, w: Int, zero: Boolean = false) {
+  private val rf = Mem(n, UInt(width = w))
+  private def access(addr: UInt) = rf(~addr(log2Up(n)-1,0))
+  private val reads = collection.mutable.ArrayBuffer[(UInt,UInt)]()
+  private var canRead = true
+  def read(addr: UInt) = {
+    require(canRead)
+    reads += addr -> Wire(UInt())
+    reads.last._2 := Mux(Bool(zero) && addr === UInt(0), UInt(0), access(addr))
+    reads.last._2
+  }
+  def write(addr: UInt, data: UInt) = {
+    canRead = false
+    when (addr =/= UInt(0)) {
+      access(addr) := data
+      for ((raddr, rdata) <- reads)
+        when (addr === raddr) { rdata := data }
+    }
+  }
+}
+
+object ImmGen {
+  def apply(sel: UInt, inst: UInt) = {
+    val sign = Mux(sel === IMM_Z, SInt(0), inst(31).toSInt)
+    val b30_20 = Mux(sel === IMM_U, inst(30,20).toSInt, sign)
+    val b19_12 = Mux(sel =/= IMM_U && sel =/= IMM_UJ, sign, inst(19,12).toSInt)
+    val b11 = Mux(sel === IMM_U || sel === IMM_Z, SInt(0),
+              Mux(sel === IMM_UJ, inst(20).toSInt,
+              Mux(sel === IMM_SB, inst(7).toSInt, sign)))
+    val b10_5 = Mux(sel === IMM_U || sel === IMM_Z, Bits(0), inst(30,25))
+    val b4_1 = Mux(sel === IMM_U, Bits(0),
+               Mux(sel === IMM_S || sel === IMM_SB, inst(11,8),
+               Mux(sel === IMM_Z, inst(19,16), inst(24,21))))
+    val b0 = Mux(sel === IMM_S, inst(7),
+             Mux(sel === IMM_I, inst(20),
+             Mux(sel === IMM_Z, inst(15), Bits(0))))
+
+    Cat(sign, b30_20, b19_12, b11, b10_5, b4_1, b0).toSInt
+  }
+}
+
+class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
+  val io = new Bundle {
+    val prci = new PRCITileIO().flip
+    val imem  = new FrontendIO()(p.alterPartial({case CacheName => "L1I" }))
+    val dmem = new HellaCacheIO()(p.alterPartial({ case CacheName => "L1D" }))
+    val ptw = new DatapathPTWIO().flip
+    val fpu = new FPUIO().flip
+    val rocc = new RoCCInterface().flip
+
+    val irq = Bool(INPUT)
+    val dbgnet = Vec(2, new DiiIO)       // debug network
+    val dbgrst = Bool(INPUT)             // reset debug network
+  }
+
+  var decode_table = new XDecode().table
+  if (usingFPU) decode_table ++= new FDecode().table
+  if (usingFPU && usingFDivSqrt) decode_table ++= new FDivSqrtDecode().table
+  if (usingRoCC) decode_table ++= new RoCCDecode().table
+
+  val ex_ctrl = Reg(new IntCtrlSigs)
+  val mem_ctrl = Reg(new IntCtrlSigs)
+  val wb_ctrl = Reg(new IntCtrlSigs)
+
+  val ex_reg_xcpt_interrupt  = Reg(Bool())
+  val ex_reg_valid           = Reg(Bool())
+  val ex_reg_btb_hit         = Reg(Bool())
+  val ex_reg_btb_resp        = Reg(io.imem.btb_resp.bits)
+  val ex_reg_xcpt            = Reg(Bool())
+  val ex_reg_flush_pipe      = Reg(Bool())
+  val ex_reg_load_use        = Reg(Bool())
+  val ex_reg_cause           = Reg(UInt())
+  val ex_reg_pc              = Reg(UInt())
+  val ex_reg_inst            = Reg(Bits())
+
+  val mem_reg_xcpt_interrupt  = Reg(Bool())
+  val mem_reg_valid           = Reg(Bool())
+  val mem_reg_btb_hit         = Reg(Bool())
+  val mem_reg_btb_resp        = Reg(io.imem.btb_resp.bits)
+  val mem_reg_xcpt            = Reg(Bool())
+  val mem_reg_replay          = Reg(Bool())
+  val mem_reg_flush_pipe      = Reg(Bool())
+  val mem_reg_cause           = Reg(UInt())
+  val mem_reg_slow_bypass     = Reg(Bool())
+  val mem_reg_pc              = Reg(UInt())
+  val mem_reg_inst            = Reg(Bits())
+  val mem_reg_wdata           = Reg(Bits())
+  val mem_reg_rs2             = Reg(Bits())
+  val take_pc_mem             = Wire(Bool())
+
+  val vectsize     = 4
+  val concatlength = vectsize*64
+  val vectaddrlength = 39*vectsize
+  val ex_isvect	      = Wire(Bool())
+  val mem_isvect   = Wire(Bool())
+  val wb_isvect    = Wire(Bool())
+  val ex_isstore   = Wire(Bool())
+  val mem_isstore  = Wire(Bool())
+  val wb_isstore   = Wire(Bool())
+  val pipeline_go = Wire(Bool())
+  val concatdata   = Reg(Bits(width=concatlength.toInt))
+  val vectcount    = Reg(Bits(width=vectsize))
+  val loadcount    = Reg(Bits(width=vectsize))
+  val vectaddr	   = Reg(Bits(width=(vectaddrlength)))
+  val count        = Wire(Bool())
+  val vect_req_valid = Reg(Bool())
+  val vect_alrvalid = Reg(Bool())
+  val vect_stall   = Reg(Bool())
+  val has_takepc   = Wire(Bool())
+  //val has_takepc_addr = Reg(Bool())
+  val ex_reg_del   = Reg(Bool())
+  val mem_reg_del  = Reg(Bool())
+  //val vect_isexe   = Reg(Bool())
+  val ex_isload    = Wire(Bool())
+  val mem_isload   = Wire(Bool())
+  val wb_isload    = Wire(Bool())
+
+  val wb_reg_valid           = Reg(Bool())
+  val wb_reg_xcpt            = Reg(Bool())
+  val wb_reg_replay          = Reg(Bool())
+  val wb_reg_cause           = Reg(UInt())
+  val wb_reg_rocc_pending    = Reg(init=Bool(false))
+  val wb_reg_pc              = Reg(UInt())
+  val wb_reg_inst            = Reg(Bits())
+  val wb_reg_wdata           = Reg(Bits())
+  val wb_reg_rs2             = Reg(Bits())
+  val take_pc_wb             = Wire(Bool())
+
+  val take_pc_mem_wb = take_pc_wb || take_pc_mem
+  val take_pc = take_pc_mem_wb
+
+  // decode stage
+  val id_pc = io.imem.resp.bits.pc
+  val id_inst = io.imem.resp.bits.data(0).toBits; require(fetchWidth == 1)
+  val id_ctrl = Wire(new IntCtrlSigs()).decode(id_inst, decode_table)
+  val id_raddr3 = id_inst(31,27)
+  val id_raddr2 = id_inst(24,20)
+  val id_raddr1 = id_inst(19,15)
+  val id_waddr  = id_inst(11,7)
+  val id_load_use = Wire(Bool())
+  val id_reg_fence = Reg(init=Bool(false))
+  val id_ren = IndexedSeq(id_ctrl.rxs1, id_ctrl.rxs2)
+  val id_raddr = IndexedSeq(id_raddr1, id_raddr2)
+  val rf = new RegFile(31, 4*xLen) // GAME I changed here!
+  val id_rs = id_raddr.map(rf.read _)
+
+  val ctrl_killd = Wire(Bool())
+
+  val csr = Module(new CSRFile(id))
+  val id_csr_en = id_ctrl.csr =/= CSR.N
+  val id_system_insn = id_ctrl.csr === CSR.I
+  val id_csr_ren = (id_ctrl.csr === CSR.S || id_ctrl.csr === CSR.C) && id_raddr1 === UInt(0)
+  val id_csr = Mux(id_csr_ren, CSR.R, id_ctrl.csr)
+  val id_csr_addr = id_inst(31,20)
+  // this is overly conservative
+  val safe_csrs = CSRs.sscratch :: CSRs.sepc :: CSRs.mscratch :: CSRs.mepc :: CSRs.mcause :: CSRs.mbadaddr :: Nil
+  val legal_csrs = collection.mutable.LinkedHashSet(CSRs.all:_*)
+  val id_csr_flush = id_system_insn || (id_csr_en && !id_csr_ren && !DecodeLogic(id_csr_addr, safe_csrs.map(UInt(_)), (legal_csrs -- safe_csrs).toList.map(UInt(_))))
+
+  val id_illegal_insn = !id_ctrl.legal ||
+    id_ctrl.fp && !csr.io.status.fs.orR ||
+    id_ctrl.rocc && !csr.io.status.xs.orR
+  // stall decode for fences (now, for AMO.aq; later, for AMO.rl and FENCE)
+  val id_amo_aq = id_inst(26)
+  val id_amo_rl = id_inst(25)
+  val id_fence_next = id_ctrl.fence || id_ctrl.amo && id_amo_rl
+  val id_mem_busy = !io.dmem.ordered || io.dmem.req.valid
+  val id_rocc_busy = Bool(usingRoCC) &&
+    (io.rocc.busy || ex_reg_valid && ex_ctrl.rocc ||
+     mem_reg_valid && mem_ctrl.rocc || wb_reg_valid && wb_ctrl.rocc)
+  id_reg_fence := id_fence_next || id_reg_fence && id_mem_busy
+  val id_do_fence = id_rocc_busy && id_ctrl.fence ||
+    id_mem_busy && (id_ctrl.amo && id_amo_aq || id_ctrl.fence_i || id_reg_fence && (id_ctrl.mem || id_ctrl.rocc) || id_csr_en)
+
+  val (id_xcpt, id_cause) = checkExceptions(List(
+    (csr.io.interrupt,          csr.io.interrupt_cause),
+    (io.imem.resp.bits.xcpt_if, UInt(Causes.fault_fetch)),
+    (id_illegal_insn,           UInt(Causes.illegal_instruction))))
+
+  val dcache_bypass_data =
+    if (fastLoadByte) io.dmem.resp.bits.data
+    else if (fastLoadWord) io.dmem.resp.bits.data_word_bypass
+    else wb_reg_wdata
+
+  // detect bypass opportunities
+  val ex_waddr = ex_reg_inst(11,7)
+  val mem_waddr = mem_reg_inst(11,7)
+  val wb_waddr = wb_reg_inst(11,7)
+  val bypass_sources = IndexedSeq(
+    (Bool(true), UInt(0), UInt(0)), // treat reading x0 as a bypass
+    (ex_reg_valid && ex_ctrl.wxd, ex_waddr, mem_reg_wdata),
+    (mem_reg_valid && mem_ctrl.wxd && !mem_ctrl.mem, mem_waddr, wb_reg_wdata),
+    (mem_reg_valid && mem_ctrl.wxd, mem_waddr, dcache_bypass_data))
+  val id_bypass_src = id_raddr.map(raddr => bypass_sources.map(s => s._1 && s._2 === raddr))
+
+  // execute stage
+  val bypass_mux = Vec(bypass_sources.map(_._3))
+  val ex_reg_rs_bypass = Reg(Vec(id_raddr.size, Bool()))
+  val ex_reg_rs_lsb = Reg(Vec(id_raddr.size, UInt()))
+  val ex_reg_rs_msb = Reg(Vec(id_raddr.size, UInt()))
+  val ex_rs = for (i <- 0 until id_raddr.size)
+    yield Mux(ex_reg_rs_bypass(i), bypass_mux(ex_reg_rs_lsb(i)), Cat(ex_reg_rs_msb(i), ex_reg_rs_lsb(i)))
+  val ex_imm = ImmGen(ex_ctrl.sel_imm, ex_reg_inst)
+  val ex_op1 = MuxLookup(ex_ctrl.sel_alu1, SInt(0), Seq(
+    A1_RS1 -> ex_rs(0).toSInt,
+    A1_PC -> ex_reg_pc.toSInt))
+  val ex_op2 = MuxLookup(ex_ctrl.sel_alu2, SInt(0), Seq(
+    A2_RS2 -> ex_rs(1).toSInt,
+    A2_IMM -> ex_imm,
+    A2_FOUR -> SInt(4)))
+
+  val alu = Module(new ALU)
+  alu.io.dw := ex_ctrl.alu_dw
+  alu.io.fn := ex_ctrl.alu_fn
+  alu.io.in2 := ex_op2.toUInt
+  alu.io.in1 := ex_op1.toUInt
+
+  //vect_isexe := Mux(vect_isexe, 0, 
+	//	Mux(mem_isvect && id_inst(6, 0) === 51 && id_inst(14, 12) === 0 && id_inst(31) === 1 && id_pc === (ex_reg_pc + 4), 1, 0)
+
+  // multiplier and divider
+  val div = Module(new MulDiv(width = xLen,
+                              unroll = if(usingFastMulDiv) 8 else 1,
+                              earlyOut = usingFastMulDiv))
+  div.io.req.valid := ex_reg_valid && ex_ctrl.div
+  div.io.req.bits.dw := ex_ctrl.alu_dw
+  div.io.req.bits.fn := ex_ctrl.alu_fn
+  div.io.req.bits.in1 := ex_rs(0)
+  div.io.req.bits.in2 := ex_rs(1)
+  div.io.req.bits.tag := ex_waddr
+
+  //ex_reg_valid := (!ctrl_killd) || (mem_isvect && vectcount === 1 && io.dmem.resp.valid)
+  ex_reg_valid := !ctrl_killd || !pipeline_go
+  ex_reg_xcpt := !ctrl_killd && id_xcpt
+  ex_reg_xcpt_interrupt := csr.io.interrupt && !take_pc && io.imem.resp.valid
+  when (id_xcpt && pipeline_go) { ex_reg_cause := id_cause } // GAME
+
+  when (!ctrl_killd && pipeline_go) {
+    ex_ctrl := id_ctrl
+    ex_ctrl.csr := id_csr
+    ex_reg_btb_hit := io.imem.btb_resp.valid
+    when (io.imem.btb_resp.valid) { ex_reg_btb_resp := io.imem.btb_resp.bits }
+    ex_reg_flush_pipe := id_ctrl.fence_i || id_csr_flush
+    ex_reg_load_use := id_load_use
+
+    for (i <- 0 until id_raddr.size) {
+      val do_bypass = id_bypass_src(i).reduce(_||_)
+      val bypass_src = PriorityEncoder(id_bypass_src(i))
+      ex_reg_rs_bypass(i) := do_bypass
+      ex_reg_rs_lsb(i) := bypass_src
+      when (id_ren(i) && !do_bypass && pipeline_go) { // GAME
+        ex_reg_rs_lsb(i) := id_rs(i)(bypass_src.getWidth-1,0)
+        ex_reg_rs_msb(i) := id_rs(i) >> bypass_src.getWidth
+      }
+    }
+  }
+  val ex_next = !ctrl_killd || csr.io.interrupt
+  when (ex_next && pipeline_go) {
+    ex_reg_inst := id_inst
+    ex_reg_pc := id_pc
+  }
+
+  // replay inst in ex stage?
+  val wb_dcache_miss = wb_ctrl.mem && !io.dmem.resp.valid
+  val replay_ex_structural = ex_ctrl.mem && !io.dmem.req.ready ||
+                             ex_ctrl.div && !div.io.req.ready
+  val replay_ex_load_use = wb_dcache_miss && ex_reg_load_use
+  val replay_ex = ex_reg_valid && (replay_ex_structural || replay_ex_load_use)
+  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid
+  // detect 2-cycle load-use delay for LB/LH/SC
+  val ex_slow_bypass = ex_ctrl.mem_cmd === M_XSC || Vec(MT_B, MT_BU, MT_H, MT_HU).contains(ex_ctrl.mem_type)
+
+  val (ex_xcpt, ex_cause) = checkExceptions(List(
+    (ex_reg_xcpt_interrupt || ex_reg_xcpt, ex_reg_cause),
+    (ex_ctrl.fp && io.fpu.illegal_rm,      UInt(Causes.illegal_instruction))))
+
+  // memory stage
+  val mem_br_taken = mem_reg_wdata(0)
+  val mem_br_target = mem_reg_pc.toSInt +
+    Mux(mem_ctrl.branch && mem_br_taken, ImmGen(IMM_SB, mem_reg_inst),
+    Mux(mem_ctrl.jal, ImmGen(IMM_UJ, mem_reg_inst), SInt(4)))
+  val mem_int_wdata = Mux(mem_ctrl.jalr, mem_br_target, mem_reg_wdata.toSInt).toUInt
+  val mem_npc = (Mux(mem_ctrl.jalr, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).toSInt, mem_br_target) & SInt(-2)).toUInt
+  val mem_wrong_npc = mem_npc =/= ex_reg_pc || !ex_reg_valid
+  val mem_npc_misaligned = mem_npc(1)
+  val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
+  val mem_cfi_taken = (mem_ctrl.branch && mem_br_taken) || mem_ctrl.jalr || mem_ctrl.jal
+  val mem_misprediction =
+    if (p(BtbKey).nEntries == 0) mem_cfi_taken
+    else mem_cfi && mem_wrong_npc
+  val want_take_pc_mem = mem_reg_valid && (mem_misprediction || mem_reg_flush_pipe)
+  take_pc_mem := want_take_pc_mem && !mem_npc_misaligned
+
+  mem_reg_valid := !ctrl_killx
+  mem_reg_replay := !take_pc_mem_wb && replay_ex
+  mem_reg_xcpt := !ctrl_killx && ex_xcpt
+  mem_reg_xcpt_interrupt := !take_pc_mem_wb && ex_reg_xcpt_interrupt
+  when (ex_xcpt && pipeline_go) { mem_reg_cause := ex_cause } // GAME
+
+  concatdata(255, 192) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(155, 117), io.dmem.resp.bits.data, concatdata(255, 192))
+  concatdata(191, 128) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(116, 78), io.dmem.resp.bits.data, concatdata(191, 128))
+  concatdata(127, 64) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(77, 39), io.dmem.resp.bits.data, concatdata(127, 64))
+  concatdata(63, 0) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(38, 0), io.dmem.resp.bits.data, concatdata(63, 0))
+  //concatdata(127,64) := io.dmem.test
+
+  count := (mem_isvect && (vectcount === 0 && io.dmem.resp.bits.addr === vectaddr(38, 0)|| (vectcount === 1 && io.dmem.resp.bits.addr === vectaddr(77, 39) && io.dmem.resp.valid) || (vectcount === 2 && io.dmem.resp.bits.addr === vectaddr(116, 78) && io.dmem.resp.valid) || (vectcount === 3 && io.dmem.resp.bits.addr === vectaddr(155, 117) && io.dmem.resp.valid)))
+
+  vectcount := Mux(pipeline_go || has_takepc, 0,
+	       Mux(count, vectcount + 1, vectcount))
+  loadcount := Mux(mem_isvect && loadcount === vectsize, loadcount,
+	       Mux(mem_isload, loadcount + 1,
+	       Mux(pipeline_go || has_takepc, 0, loadcount
+	       )))
+  has_takepc := ex_reg_del || mem_reg_del
+  ex_reg_del := Mux(take_pc && ex_isvect, 1,
+	 	Mux(ex_next && pipeline_go, 0, ex_reg_del))
+  mem_reg_del := Mux(take_pc && ex_isvect, 1,
+		 Mux((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go && !ex_reg_del, 0, mem_reg_del))
+
+  //when (((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go) || vectcount === 2) {
+  when (((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go)) {
+    mem_ctrl := ex_ctrl
+    mem_reg_btb_hit := ex_reg_btb_hit
+    when (ex_reg_btb_hit) { mem_reg_btb_resp := ex_reg_btb_resp }
+    mem_reg_flush_pipe := ex_reg_flush_pipe
+    mem_reg_slow_bypass := ex_slow_bypass
+
+    mem_reg_inst := ex_reg_inst
+    mem_reg_pc := ex_reg_pc
+    mem_reg_wdata := alu.io.out
+    vectaddr(38, 0) := alu.io.out
+    vectaddr(77, 39) := alu.io.out + 8
+    vectaddr(116, 78) := alu.io.out + 16
+    vectaddr(155, 117) := alu.io.out +24
+    when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc)) {
+      mem_reg_rs2 := ex_rs(1)
+    }
+  }
+
+  val (mem_xcpt, mem_cause) = checkExceptions(List(
+    (mem_reg_xcpt_interrupt || mem_reg_xcpt,              mem_reg_cause),
+    (want_take_pc_mem && mem_npc_misaligned,              UInt(Causes.misaligned_fetch)),
+    (mem_reg_valid && mem_ctrl.mem && io.dmem.xcpt.ma.st, UInt(Causes.misaligned_store)),
+    (mem_reg_valid && mem_ctrl.mem && io.dmem.xcpt.ma.ld, UInt(Causes.misaligned_load)),
+    (mem_reg_valid && mem_ctrl.mem && io.dmem.xcpt.pf.st, UInt(Causes.fault_store)),
+    (mem_reg_valid && mem_ctrl.mem && io.dmem.xcpt.pf.ld, UInt(Causes.fault_load))))
+
+  val dcache_kill_mem = mem_reg_valid && mem_ctrl.wxd && io.dmem.replay_next // structural hazard on writeback port
+  val fpu_kill_mem = mem_reg_valid && mem_ctrl.fp && io.fpu.nack_mem
+  val replay_mem  = dcache_kill_mem || mem_reg_replay || fpu_kill_mem
+  val killm_common = dcache_kill_mem || take_pc_wb || mem_reg_xcpt || !mem_reg_valid
+  div.io.kill := killm_common && Reg(next = div.io.req.fire())
+  val ctrl_killm = killm_common || mem_xcpt || fpu_kill_mem
+
+  // writeback stage
+  wb_reg_valid := (!mem_isvect && !ctrl_killm) || (mem_isvect && vectcount === vectsize && !ctrl_killm)
+  wb_reg_replay := replay_mem && !take_pc_wb
+  wb_reg_xcpt := mem_xcpt && !take_pc_wb
+  val next_mem = mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt || wb_isvect
+  when (mem_xcpt && pipeline_go) { wb_reg_cause := mem_cause } // GAME
+  when (next_mem && pipeline_go && !has_takepc) {
+    wb_ctrl := mem_ctrl
+    wb_reg_wdata := Mux(mem_ctrl.fp && mem_ctrl.wxd, io.fpu.toint_data, mem_int_wdata)
+    when (mem_ctrl.rocc) {
+      wb_reg_rs2 := mem_reg_rs2
+    }
+    wb_reg_inst := mem_reg_inst
+    wb_reg_pc := mem_reg_pc
+  }
+
+  val wb_set_sboard = (wb_ctrl.div || wb_dcache_miss || wb_ctrl.rocc) && !(wb_isvect)
+  val replay_wb_common = io.dmem.s2_nack || wb_reg_replay
+  val wb_rocc_val = wb_reg_valid && wb_ctrl.rocc && !replay_wb_common
+  val replay_wb = replay_wb_common || wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
+  val wb_xcpt = wb_reg_xcpt || csr.io.csr_xcpt
+  take_pc_wb := replay_wb || wb_xcpt || csr.io.eret
+
+  when (wb_rocc_val && pipeline_go) { wb_reg_rocc_pending := !io.rocc.cmd.ready }
+  when (wb_reg_xcpt && pipeline_go) { wb_reg_rocc_pending := Bool(false) }
+ // GAME
+  // writeback arbitration
+  val dmem_resp_xpu = !io.dmem.resp.bits.tag(0).toBool
+  val dmem_resp_fpu =  io.dmem.resp.bits.tag(0).toBool
+  val dmem_resp_waddr = io.dmem.resp.bits.tag >> 1
+  val dmem_resp_valid = io.dmem.resp.valid && io.dmem.resp.bits.has_data
+  val dmem_resp_replay = dmem_resp_valid && io.dmem.resp.bits.replay
+
+  div.io.resp.ready := !(wb_reg_valid && wb_ctrl.wxd)
+  val ll_wdata = Wire(init = div.io.resp.bits.data)
+  val ll_waddr = Wire(init = div.io.resp.bits.tag)
+  val ll_wen = Wire(init = div.io.resp.fire())
+  if (usingRoCC) {
+    io.rocc.resp.ready := !(wb_reg_valid && wb_ctrl.wxd)
+    when (io.rocc.resp.fire()) {
+      div.io.resp.ready := Bool(false)
+      ll_wdata := io.rocc.resp.bits.data
+      ll_waddr := io.rocc.resp.bits.rd
+      ll_wen := Bool(true)
+    }
+  }
+  when (dmem_resp_replay && dmem_resp_xpu && pipeline_go) { // GAME
+    div.io.resp.ready := Bool(false)
+    if (usingRoCC)
+      io.rocc.resp.ready := Bool(false)
+    ll_waddr := dmem_resp_waddr
+    ll_wen := Bool(true)
+  }
+
+  ex_isstore := (ex_reg_inst(6, 0) === 35 && ex_reg_inst(14, 12) === 7)
+  mem_isstore := (mem_reg_inst(6, 0) === 35 && mem_reg_inst(14, 12) === 7)
+  wb_isstore := (wb_reg_inst(6, 0) === 35 && wb_reg_inst(14, 12) === 7)
+
+  ex_isload := (ex_reg_inst(14, 12) === 7 && ex_reg_inst(6, 0) === 3)
+  mem_isload := (mem_reg_inst(14, 12) === 7 && mem_reg_inst(6, 0) === 3)
+  wb_isload := (wb_reg_inst(14, 12) === 7 && wb_reg_inst(6, 0) === 3)
+
+  ex_isvect := ex_isload || ex_isstore
+  mem_isvect := mem_isload || mem_isstore
+  wb_isvect := wb_isload || wb_isstore
+  pipeline_go := (vectcount === vectsize || (mem_isvect && wb_isvect && mem_reg_pc === wb_reg_pc) || !mem_isvect || has_takepc)
+  val wb_valid = wb_reg_valid && !replay_wb && !csr.io.csr_xcpt
+  val wb_wen = wb_valid && wb_ctrl.wxd
+  val rf_wen = (wb_wen || ll_wen)
+  val rf_waddr = Mux(ll_wen, ll_waddr, wb_waddr)
+  val rf_wdata = Mux(wb_isload, concatdata,
+		 Mux(dmem_resp_valid && dmem_resp_xpu && !wb_isvect, io.dmem.resp.bits.data,
+                 Mux(ll_wen, ll_wdata,
+                 Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
+                 wb_reg_wdata))))
+  when (rf_wen) { rf.write(rf_waddr, rf_wdata)}
+  //when (rf_wen && isvect) { rf.write(17, isvect)
+//			    rf.write(16, concatdata)}
+
+  // hook up control/status regfile
+  csr.io.exception := wb_reg_xcpt
+  csr.io.cause := wb_reg_cause
+  csr.io.retire := wb_valid
+  csr.io.irq <> io.irq
+  csr.io.prci <> io.prci
+  io.fpu.fcsr_rm := csr.io.fcsr_rm
+  csr.io.fcsr_flags := io.fpu.fcsr_flags
+  csr.io.rocc <> io.rocc
+  csr.io.pc := wb_reg_pc
+  csr.io.uarch_counters.foreach(_ := Bool(false))
+  io.ptw.ptbr := csr.io.ptbr
+  io.ptw.invalidate := csr.io.fatc
+  io.ptw.status := csr.io.status
+  csr.io.rw.addr := wb_reg_inst(31,20)
+  csr.io.rw.cmd := Mux(wb_reg_valid, wb_ctrl.csr, CSR.N)
+  csr.io.rw.wdata := wb_reg_wdata
+
+  val hazard_targets = Seq((id_ctrl.rxs1 && id_raddr1 =/= UInt(0), id_raddr1),
+                           (id_ctrl.rxs2 && id_raddr2 =/= UInt(0), id_raddr2),
+                           (id_ctrl.wxd  && id_waddr  =/= UInt(0), id_waddr))
+  val fp_hazard_targets = Seq((io.fpu.dec.ren1, id_raddr1),
+                              (io.fpu.dec.ren2, id_raddr2),
+                              (io.fpu.dec.ren3, id_raddr3),
+                              (io.fpu.dec.wen, id_waddr))
+
+  val sboard = new Scoreboard(32)
+  sboard.clear(ll_wen, ll_waddr)
+  val id_sboard_hazard = checkHazards(hazard_targets, sboard.readBypassed _)
+  sboard.set(wb_set_sboard && wb_wen, wb_waddr)
+
+  // stall for RAW/WAW hazards on CSRs, loads, AMOs, and mul/div in execute stage.
+  val ex_cannot_bypass = ex_ctrl.csr =/= CSR.N || ex_ctrl.jalr || ex_ctrl.mem || ex_ctrl.div || ex_ctrl.fp || ex_ctrl.rocc
+  val data_hazard_ex = ex_ctrl.wxd && checkHazards(hazard_targets, _ === ex_waddr)
+  val fp_data_hazard_ex = ex_ctrl.wfd && checkHazards(fp_hazard_targets, _ === ex_waddr)
+  val id_ex_hazard = ex_reg_valid && (data_hazard_ex && ex_cannot_bypass || fp_data_hazard_ex)
+
+  // stall for RAW/WAW hazards on CSRs, LB/LH, and mul/div in memory stage.
+  val mem_mem_cmd_bh =
+    if (fastLoadWord) Bool(!fastLoadByte) && mem_reg_slow_bypass
+    else Bool(true)
+  val mem_cannot_bypass = mem_ctrl.csr =/= CSR.N || mem_ctrl.mem && mem_mem_cmd_bh || mem_ctrl.div || mem_ctrl.fp || mem_ctrl.rocc
+  val data_hazard_mem = mem_ctrl.wxd && checkHazards(hazard_targets, _ === mem_waddr)
+  val fp_data_hazard_mem = mem_ctrl.wfd && checkHazards(fp_hazard_targets, _ === mem_waddr)
+  val id_mem_hazard = mem_reg_valid && (data_hazard_mem && mem_cannot_bypass || fp_data_hazard_mem)
+  id_load_use := mem_reg_valid && data_hazard_mem && mem_ctrl.mem
+
+  // stall for RAW/WAW hazards on load/AMO misses and mul/div in writeback.
+  val data_hazard_wb = wb_ctrl.wxd && checkHazards(hazard_targets, _ === wb_waddr)
+  val fp_data_hazard_wb = wb_ctrl.wfd && checkHazards(fp_hazard_targets, _ === wb_waddr)
+  val id_wb_hazard = wb_reg_valid && (data_hazard_wb && wb_set_sboard || fp_data_hazard_wb)
+
+  val id_stall_fpu = if (usingFPU) {
+    val fp_sboard = new Scoreboard(32)
+    fp_sboard.set((wb_dcache_miss && wb_ctrl.wfd || io.fpu.sboard_set) && wb_valid, wb_waddr)
+    fp_sboard.clear(dmem_resp_replay && dmem_resp_fpu, dmem_resp_waddr)
+    fp_sboard.clear(io.fpu.sboard_clr, io.fpu.sboard_clra)
+
+    id_csr_en && !io.fpu.fcsr_rdy || checkHazards(fp_hazard_targets, fp_sboard.read _)
+  } else Bool(false)
+
+  val ctrl_stalld =
+    id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
+    id_ctrl.fp && id_stall_fpu ||
+    id_ctrl.mem && !io.dmem.req.ready ||
+    Bool(usingRoCC) && wb_reg_rocc_pending && id_ctrl.rocc && !io.rocc.cmd.ready ||
+    id_do_fence ||
+    csr.io.csr_stall
+  ctrl_killd := !io.imem.resp.valid || take_pc || ctrl_stalld || csr.io.interrupt
+
+  io.imem.req.valid := take_pc
+  io.imem.req.bits.pc :=
+    Mux(wb_xcpt || csr.io.eret, csr.io.evec,     // exception or [m|s]ret
+    Mux(replay_wb,              wb_reg_pc,       // replay
+                                mem_npc)).toUInt // mispredicted branch
+  io.imem.flush_icache := wb_reg_valid && wb_ctrl.fence_i
+  io.imem.flush_tlb := csr.io.fatc
+  io.imem.resp.ready := (!ctrl_stalld || csr.io.interrupt) && pipeline_go
+
+  io.imem.btb_update.valid := mem_reg_valid && !mem_npc_misaligned && mem_wrong_npc && mem_cfi_taken && !take_pc_wb
+  io.imem.btb_update.bits.isJump := mem_ctrl.jal || mem_ctrl.jalr
+  io.imem.btb_update.bits.isReturn := mem_ctrl.jalr && mem_reg_inst(19,15) === BitPat("b00??1")
+  io.imem.btb_update.bits.pc := mem_reg_pc
+  io.imem.btb_update.bits.target := io.imem.req.bits.pc
+  io.imem.btb_update.bits.br_pc := mem_reg_pc
+  io.imem.btb_update.bits.prediction.valid := mem_reg_btb_hit
+  io.imem.btb_update.bits.prediction.bits := mem_reg_btb_resp
+
+  io.imem.bht_update.valid := mem_reg_valid && mem_ctrl.branch && !take_pc_wb
+  io.imem.bht_update.bits.pc := mem_reg_pc
+  io.imem.bht_update.bits.taken := mem_br_taken
+  io.imem.bht_update.bits.mispredict := mem_wrong_npc
+  io.imem.bht_update.bits.prediction := io.imem.btb_update.bits.prediction
+
+  io.imem.ras_update.valid := mem_reg_valid && io.imem.btb_update.bits.isJump && !mem_npc_misaligned && !take_pc_wb
+  io.imem.ras_update.bits.returnAddr := mem_int_wdata
+  io.imem.ras_update.bits.isCall := mem_ctrl.wxd && mem_waddr(0)
+  io.imem.ras_update.bits.isReturn := io.imem.btb_update.bits.isReturn
+  io.imem.ras_update.bits.prediction := io.imem.btb_update.bits.prediction
+
+  io.fpu.valid := !ctrl_killd && id_ctrl.fp
+  io.fpu.killx := ctrl_killx
+  io.fpu.killm := killm_common
+  io.fpu.inst := id_inst
+  io.fpu.fromint_data := ex_rs(0)
+  io.fpu.dmem_resp_val := dmem_resp_valid && dmem_resp_fpu
+  io.fpu.dmem_resp_data := io.dmem.resp.bits.data_word_bypass
+  io.fpu.dmem_resp_type := io.dmem.resp.bits.typ
+  io.fpu.dmem_resp_tag := dmem_resp_waddr
+  
+  vect_alrvalid := Mux(pipeline_go || count, 0, 
+		   Mux(io.dmem.req.valid && mem_isstore, 1, vect_alrvalid))
+  //vect_alrvalid := 0
+  //vect_req_valid := Mux((ex_reg_valid && ex_ctrl.mem && vectcount === 0 && mem_isvect), 1,
+  //Mux(pipeline_go, 0, vect_req_valid))
+  //io.dmem.req.valid     := ((ex_reg_valid && ex_ctrl.mem) || (vect_req_valid && vectcount === 2) || (vectcount === 1 && !vect_alrvalid)) && !(vectcount === 1 && vect_alrvalid) //|| (mem_isstore && count)
+  io.dmem.req.valid := (!mem_isvect && !ex_isvect && ex_reg_valid && ex_ctrl.mem) || (mem_isload && !vect_alrvalid && loadcount =/= vectsize) || (mem_isstore && !vect_alrvalid && vectcount =/= vectsize)
+  val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
+  require(coreDCacheReqTagBits >= ex_dcache_tag.getWidth)
+  io.dmem.req.bits.tag  := ex_dcache_tag
+  io.dmem.req.bits.cmd  := Mux(mem_isload, 0,
+			   Mux(mem_isstore, 1, ex_ctrl.mem_cmd))
+  io.dmem.req.bits.typ  := ex_ctrl.mem_type
+  io.dmem.req.bits.phys := Bool(false)
+  io.dmem.req.bits.addr := encodeVirtualAddress(ex_rs(0), Mux(mem_isload && loadcount === 0, vectaddr(38, 0), 
+							  Mux(mem_isload && loadcount === 1, vectaddr(77, 39), 
+							  Mux(mem_isload && loadcount === 2, vectaddr(116, 78),
+							  Mux(mem_isload && loadcount === 3, vectaddr(155, 117),
+							  Mux(mem_isstore && vectcount === 0, vectaddr(38, 0), 
+							  Mux(mem_isstore && vectcount === 1, vectaddr(77, 39), 
+							  Mux(mem_isstore && vectcount === 2, vectaddr(116, 78),
+							  Mux(mem_isstore && vectcount === 3, vectaddr(155, 117), alu.io.adder_out)))))))))
+  io.dmem.s1_kill := killm_common || mem_xcpt
+  io.dmem.s1_data := Mux(mem_isstore && vectcount === 3, mem_reg_rs2(255, 192), 
+	    	     Mux(mem_isstore && vectcount === 2, mem_reg_rs2(191, 128),
+		     Mux(mem_isstore && vectcount === 1, mem_reg_rs2(127, 64),
+		     Mux(mem_ctrl.fp, io.fpu.store_data, mem_reg_rs2(63, 0)))))
+  io.dmem.invalidate_lr := wb_xcpt
+
+  io.rocc.cmd.valid := wb_rocc_val
+  io.rocc.exception := wb_xcpt && csr.io.status.xs.orR
+  io.rocc.status := csr.io.status
+  io.rocc.cmd.bits.inst := new RoCCInstruction().fromBits(wb_reg_inst)
+  io.rocc.cmd.bits.rs1 := wb_reg_wdata
+  io.rocc.cmd.bits.rs2 := wb_reg_rs2
+
+  if (emitLog) {
+    if (enableCommitLog) {
+      val pc = Wire(SInt(width=xLen))
+      pc := wb_reg_pc
+      val inst = wb_reg_inst
+      val rd = RegNext(RegNext(RegNext(id_waddr)))
+      val wfd = wb_ctrl.wfd
+      val wxd = wb_ctrl.wxd
+      val has_data = wb_wen && !wb_set_sboard
+      val priv = csr.io.status.prv
+
+      when (wb_valid) {
+        when (wfd) {
+          printf ("%d 0x%x (0x%x) f%d p%d 0xXXXXXXXXXXXXXXXX\n", priv, pc, inst, rd, rd+UInt(32))
+        }
+          .elsewhen (wxd && rd =/= UInt(0) && has_data) {
+          printf ("%d 0x%x (0x%x) x%d 0x%x\n", priv, pc, inst, rd, rf_wdata)
+        }
+          .elsewhen (wxd && rd =/= UInt(0) && !has_data) {
+          printf ("%d 0x%x (0x%x) x%d p%d 0xXXXXXXXXXXXXXXXX\n", priv, pc, inst, rd, rd)
+      }
+
+      when (ll_wen && rf_waddr =/= UInt(0)) {
+        printf ("x%d p%d 0x%x\n", rf_waddr, rf_waddr, rf_wdata)
+      }
+    }
+
+      when (ll_wen && rf_waddr =/= UInt(0)) {
+        printf ("x%d p%d 0x%x\n", rf_waddr, rf_waddr, rf_wdata)
+      }
+    } else {
+      printf("C%d: %d [%d] pc=[%x] W[r%d=%x][%d] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
+        UInt(id), csr.io.time(31,0), wb_valid, wb_reg_pc,
+        Mux(rf_wen, rf_waddr, UInt(0)), rf_wdata, rf_wen,
+        wb_reg_inst(19,15), Reg(next=Reg(next=ex_rs(0))),
+        wb_reg_inst(24,20), Reg(next=Reg(next=ex_rs(1))),
+        wb_reg_inst, wb_reg_inst)
+    }
+  }
+
+  if(p(UseDebug)) {
+
+    // core tracer module
+    def isCsrRead(cmd:UInt, addr:UInt):Bool = cmd =/= CSR.N && cmd =/= CSR.I
+    def isCsrWrite(cmd:UInt, addr:UInt):Bool =
+      cmd =/= CSR.N && cmd =/= CSR.I && cmd =/= CSR.R && !addr(11,10).andR
+    def isCsrTrap(cmd:UInt, addr:UInt):Bool =
+      cmd =/= CSR.I && (!addr(8) || addr(1,0) === UInt(0)) // break, call, eret
+
+    val ctm = Module(new RocketCoreTracer(
+      id, isRead, isWrite,
+      isCsrRead, isCsrWrite, isCsrTrap
+    )(io.dbgrst))
+    ctm.io.wb_valid := wb_valid
+    ctm.io.wb_pc := wb_reg_pc
+    ctm.io.wb_wdata := rf_wdata
+    ctm.io.wb_jal := wb_ctrl.jal
+    ctm.io.wb_jalr := wb_ctrl.jalr
+    ctm.io.wb_br := wb_ctrl.branch
+    ctm.io.wb_mem := wb_ctrl.mem
+    ctm.io.wb_mem_cmd := wb_ctrl.mem_cmd
+    ctm.io.wb_xcpt := wb_reg_xcpt
+    ctm.io.wb_csr := wb_ctrl.csr =/= CSR.N
+    ctm.io.wb_csr_cmd := wb_ctrl.csr
+    ctm.io.wb_csr_addr := csr.io.rw.addr
+    ctm.io.mem_br_taken := mem_br_taken
+    ctm.io.mem_npc := mem_npc
+    ctm.io.csr_eret := csr.io.eret
+    ctm.io.csr_xcpt := csr.io.csr_xcpt
+    ctm.io.csr_prv := csr.io.status.prv
+    ctm.io.csr_wdata := wb_reg_wdata
+    ctm.io.csr_evec := csr.io.evec
+    ctm.io.csr_time := csr.io.time
+    ctm.io.dmem_has_data := dmem_resp_valid
+    ctm.io.dmem_replay := io.dmem.resp.bits.replay
+    ctm.io.dmem_rdata := io.dmem.resp.bits.data
+    ctm.io.dmem_wdata := io.dmem.resp.bits.store_data
+    ctm.io.dmem_addr := io.dmem.resp.bits.addr
+
+    // software tracer module
+    val stm = Module(new RocketSoftwareTracer(id, true)(io.dbgrst))
+    stm.io.retire := wb_valid
+    stm.io.reg_wdata := rf_wdata
+    stm.io.reg_waddr := rf_waddr
+    stm.io.reg_wen := rf_wen
+    stm.io.csr_wdata := io.rocc.csr.wdata
+    stm.io.csr_waddr := io.rocc.csr.waddr
+    stm.io.csr_wen := io.rocc.csr.wen
+
+    // the part of ring network inside a Rocket core
+    val network = Module(new RocketDebugNetwork(id)(io.dbgrst))
+    network.io.net <> io.dbgnet
+    network.io.ctm <> ctm.io.net
+    network.io.stm <> stm.io.net
+  }
+
+  def checkExceptions(x: Seq[(Bool, UInt)]) =
+    (x.map(_._1).reduce(_||_), PriorityMux(x))
+
+  def checkHazards(targets: Seq[(Bool, UInt)], cond: UInt => Bool) =
+    targets.map(h => h._1 && cond(h._2)).reduce(_||_)
+
+  def encodeVirtualAddress(a0: UInt, ea: UInt) = if (xLen == 32) ea else {
+    // efficient means to compress 64-bit VA into vaddrBits+1 bits
+    // (VA is bad if VA(vaddrBits) != VA(vaddrBits-1))
+    val a = a0 >> vaddrBits-1
+    val e = ea(vaddrBits,vaddrBits-1).toSInt
+    val msb =
+      Mux(a === UInt(0) || a === UInt(1), e =/= SInt(0),
+      Mux(a.toSInt === SInt(-1) || a.toSInt === SInt(-2), e === SInt(-1), e(0)))
+    Cat(msb, ea(vaddrBits-1,0))
+  }
+
+  class Scoreboard(n: Int)
+  {
+    def set(en: Bool, addr: UInt): Unit = update(en, _next | mask(en, addr))
+    def clear(en: Bool, addr: UInt): Unit = update(en, _next & ~mask(en, addr))
+    def read(addr: UInt): Bool = r(addr)
+    def readBypassed(addr: UInt): Bool = _next(addr)
+
+    private val r = Reg(init=Bits(0, n))
+    private var _next = r
+    private var ens = Bool(false)
+    private def mask(en: Bool, addr: UInt) = Mux(en, UInt(1) << addr, UInt(0))
+    private def update(en: Bool, update: UInt) = {
+      _next = update
+      ens = ens || en
+      when (ens) { r := _next }
+    }
+  }
+}
